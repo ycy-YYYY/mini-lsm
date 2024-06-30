@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::ops::{Bound, Deref};
+use std::os::linux::raw::stat;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
@@ -23,7 +24,7 @@ use crate::lsm_iterator::{FusedIterator, LsmIterator};
 use crate::manifest::Manifest;
 use crate::mem_table::{map_bound, MemTable};
 use crate::mvcc::LsmMvccInner;
-use crate::table::{SsTable, SsTableIterator};
+use crate::table::{SsTable, SsTableBuilder, SsTableIterator};
 
 pub type BlockCache = moka::sync::Cache<(usize, usize), Arc<Block>>;
 
@@ -158,7 +159,8 @@ impl Drop for MiniLsm {
 
 impl MiniLsm {
     pub fn close(&self) -> Result<()> {
-        unimplemented!()
+        self.flush_notifier.send(())?;
+        Ok(())
     }
 
     /// Start the storage engine by either loading an existing directory or creating a new one if the directory does
@@ -242,6 +244,10 @@ impl LsmStorageInner {
     pub(crate) fn open(path: impl AsRef<Path>, options: LsmStorageOptions) -> Result<Self> {
         let path = path.as_ref();
         let state = LsmStorageState::create(&options);
+
+        if !path.exists() {
+            std::fs::create_dir_all(path)?;
+        }
 
         let compaction_controller = match &options.compaction_options {
             CompactionOptions::Leveled(options) => {
@@ -410,7 +416,34 @@ impl LsmStorageInner {
 
     /// Force flush the earliest-created immutable memtable to disk
     pub fn force_flush_next_imm_memtable(&self) -> Result<()> {
-        unimplemented!()
+        let _state_lock = self.state_lock.lock();
+        let flush_memtable;
+        {
+            let guard = self.state.read();
+            flush_memtable = guard
+                .imm_memtables
+                .last()
+                .expect("No imm memtable to flush")
+                .clone();
+        };
+
+        let sst_id = flush_memtable.id();
+        let sst_path = self.path_of_sst(sst_id);
+        let mut sst_builder = SsTableBuilder::new(self.options.block_size);
+        flush_memtable.flush(&mut sst_builder)?;
+        let sst = Arc::new(sst_builder.build(sst_id, Some(self.block_cache.clone()), sst_path)?);
+
+        {
+            let mut guard = self.state.write();
+            let mut snapshot = guard.as_ref().clone();
+            snapshot.sstables.insert(sst_id, sst.clone());
+            // push the sst_id to front snapshot.l0_sstables. (latest to oldest order)
+            snapshot.l0_sstables.insert(0, sst_id);
+            let mem = snapshot.imm_memtables.pop().unwrap();
+            assert!(sst_id == mem.id());
+            *guard = Arc::new(snapshot);
+        }
+        Ok(())
     }
 
     pub fn new_txn(&self) -> Result<()> {
@@ -426,7 +459,6 @@ impl LsmStorageInner {
     ) -> Result<FusedIterator<LsmIterator>> {
         let snapshot = {
             let guard = self.state.read();
-            let t = &guard;
             Arc::clone(&guard)
         };
         let mut memiters = Vec::new();
@@ -441,6 +473,14 @@ impl LsmStorageInner {
         let mut table_iters = Vec::with_capacity(snapshot.l0_sstables.len());
         for table_id in snapshot.l0_sstables.iter() {
             let table = snapshot.sstables[table_id].clone();
+            if !range_overlap(
+                _lower,
+                _upper,
+                table.first_key().as_key_slice(),
+                table.last_key().as_key_slice(),
+            ) {
+                continue;
+            }
             let iter = match _lower {
                 Bound::Included(key) => {
                     SsTableIterator::create_and_seek_to_key(table, KeySlice::from_slice(key))?
@@ -468,4 +508,35 @@ impl LsmStorageInner {
             map_bound(_upper),
         )?))
     }
+}
+
+fn range_overlap(
+    user_begin: Bound<&[u8]>,
+    user_end: Bound<&[u8]>,
+    table_begin: KeySlice,
+    table_end: KeySlice,
+) -> bool {
+    match user_end {
+        Bound::Excluded(key) if key <= table_begin.raw_ref() => {
+            return false;
+        }
+        Bound::Included(key) if key < table_begin.raw_ref() => {
+            return false;
+        }
+        _ => {}
+    }
+    match user_begin {
+        Bound::Excluded(key) if key >= table_end.raw_ref() => {
+            return false;
+        }
+        Bound::Included(key) if key > table_end.raw_ref() => {
+            return false;
+        }
+        _ => {}
+    }
+    true
+}
+
+fn key_within(user_key: &[u8], table_begin: KeySlice, table_end: KeySlice) -> bool {
+    table_begin.raw_ref() <= user_key && user_key <= table_end.raw_ref()
 }

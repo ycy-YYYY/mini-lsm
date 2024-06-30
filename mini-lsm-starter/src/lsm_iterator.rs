@@ -58,6 +58,10 @@ impl StorageIterator for LsmIterator {
         self.move_to_next_valid()?;
         Ok(())
     }
+
+    fn num_active_iterators(&self) -> usize {
+        self.inner.num_active_iterators()
+    }
 }
 
 impl LsmIterator {
@@ -135,5 +139,9 @@ impl<I: StorageIterator> StorageIterator for FusedIterator<I> {
             }
         }
         Ok(())
+    }
+
+    fn num_active_iterators(&self) -> usize {
+        self.iter.num_active_iterators()
     }
 }
