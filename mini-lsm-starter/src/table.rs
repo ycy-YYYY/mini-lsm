@@ -65,7 +65,7 @@ impl BlockMeta {
     }
 
     /// Decode block meta from a buffer.
-    pub fn decode_block_meta(mut buf: impl Buf) -> Vec<BlockMeta> {
+    pub fn decode_block_meta(mut buf: impl Buf) -> Result<Vec<BlockMeta>> {
         let mut block_meta = Vec::new();
         while buf.has_remaining() {
             let offset = buf.get_u32() as usize;
@@ -79,7 +79,7 @@ impl BlockMeta {
                 last_key: KeyBytes::from_bytes(last_key),
             });
         }
-        block_meta
+        Ok(block_meta)
     }
 }
 
@@ -143,31 +143,24 @@ impl SsTable {
 
     /// Open SSTable from a file.
     pub fn open(id: usize, block_cache: Option<Arc<BlockCache>>, file: FileObject) -> Result<Self> {
-        // read the last 4 bytes of the file to get the offset of block meta
-        let meta_offset = file
-            .read(
-                file.size() - size_of::<u32>() as u64,
-                size_of::<u32>() as u64,
-            )?
-            .as_slice()
-            .get_u32() as usize;
-        assert!(meta_offset < file.size() as usize);
-        let meta_data = file.read(
-            meta_offset as u64,
-            file.size() - meta_offset as u64 - size_of::<u32>() as u64,
-        )?;
-        let block_meta = BlockMeta::decode_block_meta(meta_data.as_slice());
-        let first_key = block_meta.first().unwrap().first_key.clone();
-        let last_key = block_meta.last().unwrap().last_key.clone();
+        let len = file.size();
+        let raw_bloom_offset = file.read(len - 4, 4)?;
+        let bloom_offset = (&raw_bloom_offset[..]).get_u32() as u64;
+        let raw_bloom = file.read(bloom_offset, len - 4 - bloom_offset)?;
+        let bloom_filter = Bloom::decode(&raw_bloom)?;
+        let raw_meta_offset = file.read(bloom_offset - 4, 4)?;
+        let block_meta_offset = (&raw_meta_offset[..]).get_u32() as u64;
+        let raw_meta = file.read(block_meta_offset, bloom_offset - 4 - block_meta_offset)?;
+        let block_meta = BlockMeta::decode_block_meta(&raw_meta[..])?;
         Ok(Self {
             file,
+            first_key: block_meta.first().unwrap().first_key.clone(),
+            last_key: block_meta.last().unwrap().last_key.clone(),
             block_meta,
-            block_meta_offset: meta_offset,
+            block_meta_offset: block_meta_offset as usize,
             id,
             block_cache,
-            first_key,
-            last_key,
-            bloom: None,
+            bloom: Some(bloom_filter),
             max_ts: 0,
         })
     }
